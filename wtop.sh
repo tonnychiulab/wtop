@@ -1,15 +1,15 @@
-cat << 'EOF' | sudo tee /usr/local/bin/wtop
+cat << 'EOF' | sudo tee /usr/local/bin/wtop >/dev/null
 #!/bin/bash
 # ==============================================================================
 # wtop - Wazuh Terminal Operations Center (btop-style TUI for Wazuh Server)
-# Version : v1.1.0
+# Version : v1.1.1
 # License : MIT
 # Requires: bash, tmux, jq, iproute2 (ss), awk, wazuh-manager (/var/ossec)
 # ==============================================================================
 
 set -u
 
-WTOP_VERSION="v1.1.0"
+WTOP_VERSION="v1.1.1"
 SESSION="${WTOP_SESSION:-wtop}"
 WAZUH_HOME="${WAZUH_HOME:-/var/ossec}"
 RUN_DIR="/run/wtop"
@@ -71,7 +71,7 @@ load_i18n() {
         MSG_ERR_WAZUH="錯誤：找不到 Wazuh 執行檔 (${WAZUH_HOME})。"
         MSG_MISSING_DEPS="缺少必要依賴套件："
         MSG_ASK_INSTALL="是否自動呼叫套件管理員安裝？(y/N): "
-        MSG_CHECK_OK="[OK] wtop ${WTOP_VERSION} 環境與安全性預檢全數通過！"
+        MSG_CHECK_OK="[OK] wtop ${WTOP_VERSION} 語法、環境與安全性預檢全數通過！"
         MSG_UFW_TAB="ufw 封鎖排行"
         MSG_UFW_HDR="次數  點陣比例  來源 IP          目標埠"
         MSG_UFW_NONE="近期無 UFW BLOCK 攔截紀錄"
@@ -103,7 +103,7 @@ load_i18n() {
         MSG_ERR_WAZUH="Error: Wazuh binaries not found in ${WAZUH_HOME}."
         MSG_MISSING_DEPS="Missing required packages:"
         MSG_ASK_INSTALL="Install missing packages via package manager? (y/N): "
-        MSG_CHECK_OK="[OK] wtop ${WTOP_VERSION} pre-flight & security checks passed!"
+        MSG_CHECK_OK="[OK] wtop ${WTOP_VERSION} syntax, environment & security checks passed!"
         MSG_UFW_TAB="ufw top blocked"
         MSG_UFW_HDR="CNT   BRAILLE   SOURCE IP        PORT"
         MSG_UFW_NONE="No recent UFW BLOCK records"
@@ -204,23 +204,19 @@ preflight_check() {
 # 嚴格輸入清洗、正規化與驗證引擎 (Security & Normalization)
 # ==========================================================
 
-# 讀取單行輸入並徹底剝除控制字元與前後空白
 read_clean_line() {
     local prompt="$1"
     local raw_in=""
     read -r -n 45 -p "$prompt" raw_in || true
-    # 僅保留可見 ASCII 字元並去除空白，徹底阻絕控制字元與指令注入
     LC_ALL=C printf '%s' "$raw_in" | tr -d '[:cntrl:][:space:]'
 }
 
-# Agent ID 正規化與格式驗證：
-# 1. 拒絕任何非數字字元
-# 2. 透過 $((10#raw)) 強制十進位轉型，避免 008/009 觸發 Bash 八進位崩潰
-# 3. 自動補零為 Wazuh 標準 3 位數格式 (例如輸入 6 -> 自動正規化為 006)
 normalize_agent_id() {
     local raw="$1"
+    local LC_ALL=C
     [ -z "$raw" ] && return 1
-    if ! LC_ALL=C [[ "$raw" =~ ^[0-9]{1,5}$ ]]; then
+    local num_re='^[0-9]{1,5}$'
+    if ! [[ "$raw" =~ $num_re ]]; then
         return 1
     fi
     local dec_val=$(( 10#$raw ))
@@ -232,26 +228,28 @@ normalize_agent_id() {
     return 0
 }
 
-# 檢查正規化後的 Agent ID 是否真實存在於 Wazuh Server
 agent_id_exists() {
     local norm_id="$1"
     [ "$norm_id" = "000" ] && return 0
     "$BIN_AGENT" -l 2>/dev/null | LC_ALL=C grep -qE "ID:[[:space:]]*0*${norm_id},"
 }
 
-# 嚴格驗證 IPv4 或 IPv6 位址格式
 is_valid_ip() {
     local ip="$1"
+    local LC_ALL=C
     [ -z "$ip" ] && return 1
-    if LC_ALL=C [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    local ipv4_re='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+    local ipv6_re='^[0-9a-fA-F:]+$'
+    if [[ "$ip" =~ $ipv4_re ]]; then
         local IFS='.'
         # shellcheck disable=SC2206
         local octets=($ip)
+        local o
         for o in "${octets[@]}"; do
             [ "$(( 10#$o ))" -gt 255 ] && return 1
         done
         return 0
-    elif LC_ALL=C [[ "$ip" =~ ^[0-9a-fA-F:]+$ ]] && [[ "$ip" == *:* ]] && [[ "$ip" != *:::* ]]; then
+    elif [[ "$ip" =~ $ipv6_re ]] && [[ "$ip" == *:* ]] && [[ "$ip" != *:::* ]]; then
         return 0
     fi
     return 1
@@ -264,8 +262,6 @@ safe_restart_manager() {
     systemctl restart wazuh-manager
 }
 
-# 安全讀取單一熱鍵，並完整攔截/轉換 ANSI 方向鍵跳脫序列 (\033[A..D)
-# 徹底解決按方向鍵時殘留字元 B/D 誤觸 [b]封鎖 或 [d]刪除 的嚴重問題！
 read_hotkey() {
     local timeout="${1:-2}"
     REPLY_KEY=""
@@ -277,7 +273,6 @@ read_hotkey() {
     if [ "$k1" = $'\033' ]; then
         local seq=""
         read -r -s -t 0.05 -n 2 seq || true
-        # 清空可能殘留的長 Function Key 序列 (如 F1~F12 或滑鼠事件)
         local extra=""
         read -r -s -t 0.01 -n 8 extra || true
         case "${seq}" in
@@ -297,7 +292,6 @@ read_hotkey() {
     return 0
 }
 
-# 跨面板通用導航熱鍵處理器 (讓 Panel 1~4 都能用 1-4、方向鍵、Tab、z 切換或放大)
 handle_global_hotkey() {
     local key="$1"
     local cur_lvl cur_lang next_lvl
@@ -331,7 +325,6 @@ handle_global_hotkey() {
             return 0
             ;;
         b|B|p|P|i|I|r|R|d|D|s|S)
-            # 若在 Panel 1~3 按下動作熱鍵，自動將焦點切換至 Panel 4 執行
             if [ "${CURRENT_PANE_NUM:-4}" != "4" ]; then
                 tmux select-pane -t "${SESSION}:0.3" 2>/dev/null || true
                 tmux send-keys -t "${SESSION}:0.3" "$key" 2>/dev/null || true
@@ -360,7 +353,6 @@ repeat_horiz() {
     printf '%s' "${spaces// /─}"
 }
 
-# 檢查當前 Pane 是否為使用者選中的 Active Pane，動態切換高亮青色與暗灰框線
 update_active_box_color() {
     local is_active="0"
     if [ -n "${TMUX_PANE:-}" ]; then
@@ -429,7 +421,6 @@ draw_btop_frame() {
     local hbar
     hbar=$(repeat_horiz $(( cols - 2 )))
 
-    # 1. 頂部圓角框線 ╭──╮ + 左上凹槽標題 (若為 Active 面板則亮起 ● 燈號與青色外框)
     printf '\033[1;1H%s╭%s╮%s' "$BOX_CLR" "$hbar" "$NC"
     if [ -n "$brand_prefix" ]; then
         printf '\033[1;2H%s─┐%s%s%s┌─┐%s%s%s%s%s%s┌─%s' \
@@ -447,13 +438,11 @@ draw_btop_frame() {
     fi
     printf '\033[1;%dH%s╮%s' "$cols" "$BOX_CLR" "$NC"
 
-    # 2. 左右垂直牆面 │ ... │
     local r
     for (( r = 2; r < lines; r++ )); do
         printf '\033[%d;1H%s│\033[K\033[%d;%dH%s│%s' "$r" "$BOX_CLR" "$r" "$cols" "$BOX_CLR" "$NC"
     done
 
-    # 3. 底部圓角封口線 ╰──╯
     printf '\033[%d;1H%s╰%s╯%s' "$lines" "$BOX_CLR" "$hbar" "$NC"
     if [ -n "$bottom_bar" ]; then
         printf '\033[%d;2H%s' "$lines" "$bottom_bar"
@@ -551,7 +540,7 @@ if [ "$CLI_MODE" = "check" ]; then
 fi
 
 # ==========================================================
-# 四大 TUI 面板主迴圈 (全面支援 Active 邊框變色與鍵盤導航)
+# 四大 TUI 面板主迴圈
 # ==========================================================
 case "$CLI_MODE" in
     --pane-status)
@@ -824,7 +813,6 @@ case "$CLI_MODE" in
                 done
             fi
 
-            # 倒數第二行顯示 tmux 導航提示列
             put_row $(( LINES - 1 )) "$COLS" "${DIM}${MSG_NAV_HINT}${NC}"
 
             printf '\033[?25l\033[%d;%dH' "$LINES" "$COLS"
@@ -832,7 +820,6 @@ case "$CLI_MODE" in
                 continue
             fi
 
-            # 先交由全域導航熱鍵處理 (1-4, 方向鍵, Tab, z, f, l, q)
             if handle_global_hotkey "$REPLY_KEY"; then
                 continue
             fi
@@ -860,7 +847,7 @@ case "$CLI_MODE" in
                     blk_in=$(read_clean_line "$MSG_BLK_PICK")
                     echo ""
                     TARGET_IP=""
-                    if LC_ALL=C [[ "$blk_in" =~ ^[1-5]$ ]] && [ "$blk_in" -le "${#CAND_IPS[@]}" ]; then
+                    if [[ "$blk_in" =~ ^[1-5]$ ]] && [ "$blk_in" -le "${#CAND_IPS[@]}" ]; then
                         TARGET_IP=$(echo "${CAND_IPS[$((blk_in-1))]}" | awk '{print $1}')
                     elif [ -n "$blk_in" ]; then
                         TARGET_IP="$blk_in"
@@ -997,7 +984,6 @@ case "$CLI_MODE" in
         tmux set-option -t "$SESSION" mouse on
         tmux set-option -t "$SESSION" status off
 
-        # 強化 tmux 分隔線對比度：非焦點暗灰，當前選中面板亮青色粗框
         tmux set-option -t "$SESSION" pane-border-style fg=brightblack
         tmux set-option -t "$SESSION" pane-active-border-style fg=brightcyan,bold
         tmux set-option -t "$SESSION" pane-border-lines heavy 2>/dev/null || true
@@ -1006,7 +992,6 @@ case "$CLI_MODE" in
         tmux split-window -v -t "${SESSION}:0.0" "$0 --pane-alerts"
         tmux split-window -v -t "${SESSION}:0.2" "$0 --pane-console"
 
-        # 掛載 tmux Hook：當使用者用滑鼠點擊或切換面板時，立即發送 USR1 喚醒面板秒速切換青色高亮框線
         tmux set-hook -t "$SESSION" after-select-pane \
             "run-shell 'pkill -USR1 -f \"wtop --pane-\" 2>/dev/null || true'" 2>/dev/null || true
 
@@ -1017,3 +1002,4 @@ esac
 EOF
 
 sudo chmod +x /usr/local/bin/wtop
+bash -n /usr/local/bin/wtop && wtop --check

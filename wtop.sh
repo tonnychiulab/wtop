@@ -1,15 +1,17 @@
+tmux kill-session -t wtop 2>/dev/null || true
+
 cat << 'EOF' | sudo tee /usr/local/bin/wtop >/dev/null
 #!/bin/bash
 # ==============================================================================
 # wtop - Wazuh Terminal Operations Center (btop-style TUI for Wazuh Server)
-# Version : v1.1.1
+# Version : v1.1.2
 # License : MIT
 # Requires: bash, tmux, jq, iproute2 (ss), awk, wazuh-manager (/var/ossec)
 # ==============================================================================
 
 set -u
 
-WTOP_VERSION="v1.1.1"
+WTOP_VERSION="v1.1.2"
 SESSION="${WTOP_SESSION:-wtop}"
 WAZUH_HOME="${WAZUH_HOME:-/var/ossec}"
 RUN_DIR="/run/wtop"
@@ -35,6 +37,7 @@ MAGENTA=$'\033[1;35m'
 WHITE=$'\033[1;37m'
 BOX_INACTIVE=$'\033[1;30m'   # 非焦點面板：低調鐵灰框線
 BOX_ACTIVE=$'\033[1;36m'     # 當前焦點面板：高亮青色框線
+TITLE_ACTIVE=$'\033[1;32m'   # 當前焦點標題：高亮綠字 (不佔額外字元寬度)
 TRACK_CLR=$'\033[1;30m'
 DIM=$'\033[0;37m'
 BOLD=$'\033[1m'
@@ -44,9 +47,6 @@ cleanup_tty() {
     printf '\033[?25h\033[?7h\033[0m'
 }
 trap cleanup_tty EXIT INT TERM
-
-# 收到 USR1 訊號時立即喚醒重繪（供 tmux 切換視窗 Hook 觸發零延遲邊框變色）
-trap ':' USR1
 
 detect_default_lang() {
     local sys_locale="${LC_ALL:-${LC_MESSAGES:-${LANG:-C}}}"
@@ -77,7 +77,7 @@ load_i18n() {
         MSG_UFW_NONE="近期無 UFW BLOCK 攔截紀錄"
         MSG_P1514="1514(資料)"
         MSG_P1515="1515(註冊)"
-        MSG_NAV_HINT="1-4/方向鍵:切換視窗 │ z:全螢幕放大 │ q:離開"
+        MSG_NAV_HINT="1-4/方向鍵/滑鼠:切換視窗 │ z:全螢幕放大 │ q:離開"
         MSG_PROMPT_INFO="輸入要查詢的 Agent 編號 (如 6 或 006，0 為本機): "
         MSG_PROMPT_ENTER="按 Enter 返回戰情室..."
         MSG_PROMPT_RST="輸入要重啟的 Agent 編號 (如 6 或 006): "
@@ -109,7 +109,7 @@ load_i18n() {
         MSG_UFW_NONE="No recent UFW BLOCK records"
         MSG_P1514="1514(Data)"
         MSG_P1515="1515(Auth)"
-        MSG_NAV_HINT="1-4/Arrows:Switch Pane │ z:Zoom │ q:Quit"
+        MSG_NAV_HINT="1-4/Arrows/Click:Switch Pane │ z:Zoom │ q:Quit"
         MSG_PROMPT_INFO="Enter Agent ID to inspect (e.g. 6 or 006): "
         MSG_PROMPT_ENTER="Press Enter to return..."
         MSG_PROMPT_RST="Enter Agent ID to restart (e.g. 6 or 006): "
@@ -263,7 +263,7 @@ safe_restart_manager() {
 }
 
 read_hotkey() {
-    local timeout="${1:-2}"
+    local timeout="${1:-0.2}"
     REPLY_KEY=""
     local k1=""
     if ! read -r -s -t "$timeout" -n 1 k1; then
@@ -272,7 +272,7 @@ read_hotkey() {
 
     if [ "$k1" = $'\033' ]; then
         local seq=""
-        read -r -s -t 0.05 -n 2 seq || true
+        read -r -s -t 0.03 -n 2 seq || true
         local extra=""
         read -r -s -t 0.01 -n 8 extra || true
         case "${seq}" in
@@ -343,7 +343,7 @@ handle_global_hotkey() {
 }
 
 # ==========================================================
-# btop 圓角框線 (支援 Active 面板動態高亮) 與 Braille 點陣引擎
+# btop 圓角框線 (支援 0.2s 無訊號動態高亮) 與 Braille 點陣引擎
 # ==========================================================
 repeat_horiz() {
     local len="$1"
@@ -353,17 +353,23 @@ repeat_horiz() {
     printf '%s' "${spaces// /─}"
 }
 
-update_active_box_color() {
-    local is_active="0"
+get_pane_active() {
     if [ -n "${TMUX_PANE:-}" ]; then
-        is_active=$(tmux display-message -p -t "$TMUX_PANE" '#{pane_active}' 2>/dev/null || echo "0")
+        tmux display-message -p -t "$TMUX_PANE" '#{pane_active}' 2>/dev/null || echo "0"
+    else
+        echo "0"
     fi
+}
+
+update_active_box_color() {
+    local is_active
+    is_active=$(get_pane_active)
     if [ "$is_active" = "1" ]; then
         BOX_CLR="$BOX_ACTIVE"
-        ACTIVE_MARK="${GREEN}●${NC}"
+        TITLE_CLR="$TITLE_ACTIVE"
     else
         BOX_CLR="$BOX_INACTIVE"
-        ACTIVE_MARK=""
+        TITLE_CLR="$WHITE"
     fi
 }
 
@@ -421,13 +427,14 @@ draw_btop_frame() {
     local hbar
     hbar=$(repeat_horiz $(( cols - 2 )))
 
+    # 頂部框線：不使用雙寬字元 ●，改以標題亮綠字 + 亮青色外框標示 Active 面板，確保 ┐ 不被吃掉
     printf '\033[1;1H%s╭%s╮%s' "$BOX_CLR" "$hbar" "$NC"
     if [ -n "$brand_prefix" ]; then
-        printf '\033[1;2H%s─┐%s%s%s┌─┐%s%s%s%s%s%s┌─%s' \
-            "$BOX_CLR" "$CYAN" "$brand_prefix" "$BOX_CLR" "$ACTIVE_MARK" "$RED" "$num" "$WHITE" "$title" "$BOX_CLR" "$NC"
+        printf '\033[1;2H%s─┐%s%s%s┌─┐%s%s%s%s%s┌─%s' \
+            "$BOX_CLR" "$CYAN" "$brand_prefix" "$BOX_CLR" "$RED" "$num" "$TITLE_CLR" "$title" "$BOX_CLR" "$NC"
     else
-        printf '\033[1;2H%s─┐%s%s%s%s%s%s┌─%s' \
-            "$BOX_CLR" "$ACTIVE_MARK" "$RED" "$num" "$WHITE" "$title" "$BOX_CLR" "$NC"
+        printf '\033[1;2H%s─┐%s%s%s%s%s┌─%s' \
+            "$BOX_CLR" "$RED" "$num" "$TITLE_CLR" "$title" "$BOX_CLR" "$NC"
     fi
 
     if [ -n "$right_badge" ]; then
@@ -540,84 +547,67 @@ if [ "$CLI_MODE" = "check" ]; then
 fi
 
 # ==========================================================
-# 四大 TUI 面板主迴圈
+# 四大 TUI 面板主迴圈 (0.2s 快速焦點感知 + 3s 資料快取)
 # ==========================================================
 case "$CLI_MODE" in
     --pane-status)
         CURRENT_PANE_NUM="1"
         printf '\033[?7l\033[?25l'
+        tick=0
+        prev_active=""
+        prev_cols=0
+        prev_lines=0
+        prev_lang=""
+        DAEMON_LINES=()
+        UFW_RAW=()
+        CONN_1514=0
+        CONN_1515=0
+        TOTAL_REMOTE=6
+        RUN_CNT=0
+
         while true; do
-            load_i18n
+            cur_active=$(get_pane_active)
             COLS=$(tput cols 2>/dev/null || echo 40)
             LINES=$(tput lines 2>/dev/null || echo 12)
+            cur_lang=$(cat "$STATE_LANG" 2>/dev/null || echo "zh")
 
-            CONN_1514=$(ss -tn state established '( dport = :1514 or sport = :1514 )' 2>/dev/null | tail -n +2 | wc -l)
-            CONN_1515=$(ss -tn state established '( dport = :1515 or sport = :1515 )' 2>/dev/null | tail -n +2 | wc -l)
-            TOTAL_REMOTE=$("$BIN_AGENT" -l 2>/dev/null | grep "ID:" | grep -vc "000" || true)
-            [ "${TOTAL_REMOTE:-0}" -lt 1 ] && TOTAL_REMOTE=6
+            # 每 15 個週期 (約 3 秒) 或尺寸/語系改變時更新底層資料
+            if [ "$tick" -eq 0 ] || [ "$COLS" -ne "$prev_cols" ] || [ "$LINES" -ne "$prev_lines" ] || [ "$cur_lang" != "$prev_lang" ]; then
+                load_i18n "$cur_lang"
+                CONN_1514=$(ss -tn state established '( dport = :1514 or sport = :1514 )' 2>/dev/null | tail -n +2 | wc -l)
+                CONN_1515=$(ss -tn state established '( dport = :1515 or sport = :1515 )' 2>/dev/null | tail -n +2 | wc -l)
+                TOTAL_REMOTE=$("$BIN_AGENT" -l 2>/dev/null | grep "ID:" | grep -vc "000" || true)
+                [ "${TOTAL_REMOTE:-0}" -lt 1 ] && TOTAL_REMOTE=6
 
-            DBAR_W=4
-            [ "$COLS" -ge 54 ] && DBAR_W=6
-            RUN_BAR=$(make_braille_bar 10 10 "$DBAR_W" "$GREEN")
-            STOP_BAR=$(make_braille_bar 0 10 "$DBAR_W" "$RED")
+                DBAR_W=4
+                [ "$COLS" -ge 54 ] && DBAR_W=6
+                RUN_BAR=$(make_braille_bar 10 10 "$DBAR_W" "$GREEN")
+                STOP_BAR=$(make_braille_bar 0 10 "$DBAR_W" "$RED")
 
-            STATUS_RAW=$("$BIN_CONTROL" status 2>/dev/null || true)
-            RUN_CNT=$(echo "$STATUS_RAW" | grep -E "wazuh-(analysisd|remoted|authd|integratord|modulesd|syscheckd)" | grep -c "is running" || true)
-            TOP_BAR=$(make_braille_bar "$RUN_CNT" 6 6 "$GREEN")
-            BADGE="${TOP_BAR} ${WHITE}${RUN_CNT}/6${NC}"
+                STATUS_RAW=$("$BIN_CONTROL" status 2>/dev/null || true)
+                RUN_CNT=$(echo "$STATUS_RAW" | grep -E "wazuh-(analysisd|remoted|authd|integratord|modulesd|syscheckd)" | grep -c "is running" || true)
 
-            draw_btop_frame "$COLS" "$LINES" "¹" "daemons" "$BADGE" "" "wtop ${WTOP_VERSION}"
-
-            mapfile -t DAEMON_LINES < <(
-                echo "$STATUS_RAW" | \
-                awk -v G="$GREEN" -v R="$RED" -v B="$BOX_CLR" -v N="$NC" -v rbar="$RUN_BAR" -v sbar="$STOP_BAR" '
-                    /wazuh-(analysisd|remoted|authd|integratord|modulesd|syscheckd)/ {
-                        sub(/wazuh-/, "", $1)
-                        if ($0 ~ /is running/) {
-                            st = rbar " " G "RUN " N
-                        } else {
-                            st = sbar " " R "STOP" N
+                mapfile -t DAEMON_LINES < <(
+                    echo "$STATUS_RAW" | \
+                    awk -v G="$GREEN" -v R="$RED" -v B="$BOX_INACTIVE" -v N="$NC" -v rbar="$RUN_BAR" -v sbar="$STOP_BAR" '
+                        /wazuh-(analysisd|remoted|authd|integratord|modulesd|syscheckd)/ {
+                            sub(/wazuh-/, "", $1)
+                            if ($0 ~ /is running/) {
+                                st = rbar " " G "RUN " N
+                            } else {
+                                st = sbar " " R "STOP" N
+                            }
+                            items[++n] = sprintf("%-11s %s", $1, st)
                         }
-                        items[++n] = sprintf("%-11s %s", $1, st)
-                    }
-                    END {
-                        for (i = 1; i <= n; i += 2) {
-                            if (i + 1 <= n) printf "%s %s│%s %s\n", items[i], B, N, items[i+1]
-                            else printf "%s\n", items[i]
+                        END {
+                            for (i = 1; i <= n; i += 2) {
+                                if (i + 1 <= n) printf "%s %s│%s %s\n", items[i], B, N, items[i+1]
+                                else printf "%s\n", items[i]
+                            }
                         }
-                    }
-                '
-            )
-            cur_row=2
-            for dline in "${DAEMON_LINES[@]}"; do
-                [ "$cur_row" -lt $(( LINES - 2 )) ] && put_row "$cur_row" "$COLS" "$dline"
-                cur_row=$(( cur_row + 1 ))
-            done
+                    '
+                )
 
-            PBAR_W=5
-            [ "$COLS" -ge 54 ] && PBAR_W=7
-            BAR_1514=$(make_braille_bar "$CONN_1514" "$TOTAL_REMOTE" "$PBAR_W" "$CYAN")
-            BAR_1515=$(make_braille_bar "$CONN_1515" 5 "$PBAR_W" "$YELLOW")
-            PORT_LINE=$(printf "%s %s %s%d/%d%s %s│%s %s %s %s%d%s" \
-                "$MSG_P1514" "$BAR_1514" "$GREEN" "$CONN_1514" "$TOTAL_REMOTE" "$NC" \
-                "$BOX_CLR" "$NC" \
-                "$MSG_P1515" "$BAR_1515" "$YELLOW" "$CONN_1515" "$NC")
-            if [ "$cur_row" -lt $(( LINES - 1 )) ]; then
-                put_row "$cur_row" "$COLS" "$PORT_LINE"
-                cur_row=$(( cur_row + 1 ))
-            fi
-
-            if [ "$cur_row" -lt $(( LINES - 1 )) ]; then
-                draw_btop_divider "$cur_row" "$COLS" "$MSG_UFW_TAB"
-                cur_row=$(( cur_row + 1 ))
-            fi
-            if [ "$cur_row" -lt "$LINES" ]; then
-                put_row "$cur_row" "$COLS" "${DIM}${MSG_UFW_HDR}${NC}"
-                cur_row=$(( cur_row + 1 ))
-            fi
-
-            UFW_ROWS=$(( LINES - cur_row ))
-            if [ "$UFW_ROWS" -ge 1 ]; then
                 UFW_LOG="/var/log/ufw.log"
                 [ ! -s "$UFW_LOG" ] && UFW_LOG="/var/log/syslog"
                 if [ -f "$UFW_LOG" ]; then
@@ -628,26 +618,75 @@ case "$CLI_MODE" in
                             if (match($0, /SRC=[0-9a-fA-F:\.]+/)) src=substr($0, RSTART+4, RLENGTH-4);
                             if (match($0, /DPT=[0-9]+/)) dpt=substr($0, RSTART+4, RLENGTH-4);
                             if (src != "") print src, dpt
-                        }' | sort | uniq -c | sort -nr | head -n "$UFW_ROWS"
+                        }' | sort | uniq -c | sort -nr | head -n 15
                     )
+                fi
+            fi
+
+            # 焦點改變、尺寸改變或資料更新時立即重繪畫面 (0.2 秒內反應)
+            if [ "$tick" -eq 0 ] || [ "$cur_active" != "$prev_active" ] || [ "$COLS" -ne "$prev_cols" ] || [ "$LINES" -ne "$prev_lines" ] || [ "$cur_lang" != "$prev_lang" ]; then
+                TOP_BAR=$(make_braille_bar "$RUN_CNT" 6 6 "$GREEN")
+                BADGE="${TOP_BAR} ${WHITE}${RUN_CNT}/6${NC}"
+                draw_btop_frame "$COLS" "$LINES" "¹" "daemons" "$BADGE" "" "wtop ${WTOP_VERSION}"
+
+                cur_row=2
+                for dline in "${DAEMON_LINES[@]}"; do
+                    [ "$cur_row" -lt $(( LINES - 2 )) ] && put_row "$cur_row" "$COLS" "$dline"
+                    cur_row=$(( cur_row + 1 ))
+                done
+
+                PBAR_W=5
+                [ "$COLS" -ge 54 ] && PBAR_W=7
+                BAR_1514=$(make_braille_bar "$CONN_1514" "$TOTAL_REMOTE" "$PBAR_W" "$CYAN")
+                BAR_1515=$(make_braille_bar "$CONN_1515" 5 "$PBAR_W" "$YELLOW")
+                PORT_LINE=$(printf "%s %s %s%d/%d%s %s│%s %s %s %s%d%s" \
+                    "$MSG_P1514" "$BAR_1514" "$GREEN" "$CONN_1514" "$TOTAL_REMOTE" "$NC" \
+                    "$BOX_CLR" "$NC" \
+                    "$MSG_P1515" "$BAR_1515" "$YELLOW" "$CONN_1515" "$NC")
+                if [ "$cur_row" -lt $(( LINES - 1 )) ]; then
+                    put_row "$cur_row" "$COLS" "$PORT_LINE"
+                    cur_row=$(( cur_row + 1 ))
+                fi
+
+                if [ "$cur_row" -lt $(( LINES - 1 )) ]; then
+                    draw_btop_divider "$cur_row" "$COLS" "$MSG_UFW_TAB"
+                    cur_row=$(( cur_row + 1 ))
+                fi
+                if [ "$cur_row" -lt "$LINES" ]; then
+                    put_row "$cur_row" "$COLS" "${DIM}${MSG_UFW_HDR}${NC}"
+                    cur_row=$(( cur_row + 1 ))
+                fi
+
+                UFW_ROWS=$(( LINES - cur_row ))
+                if [ "$UFW_ROWS" -ge 1 ]; then
                     if [ "${#UFW_RAW[@]}" -gt 0 ]; then
                         MAX_UFW=$(echo "${UFW_RAW[0]}" | awk '{print $1}')
+                        u_idx=0
                         for uentry in "${UFW_RAW[@]}"; do
+                            [ "$u_idx" -ge "$UFW_ROWS" ] && break
                             read -r ucnt usrc udpt <<< "$uentry"
                             UBAR=$(make_braille_bar "$ucnt" "$MAX_UFW" 6 "$RED")
                             uline=$(printf "%s%4d%s  %s  %s%-16s%s (Port: %s%s%s)" \
                                 "$YELLOW" "$ucnt" "$NC" "$UBAR" "$MAGENTA" "$usrc" "$NC" "$CYAN" "$udpt" "$NC")
                             [ "$cur_row" -lt "$LINES" ] && put_row "$cur_row" "$COLS" "$uline"
                             cur_row=$(( cur_row + 1 ))
+                            u_idx=$(( u_idx + 1 ))
                         done
                     else
                         put_row "$cur_row" "$COLS" "${GREEN}${MSG_UFW_NONE}${NC}"
                     fi
                 fi
+
+                prev_active="$cur_active"
+                prev_cols="$COLS"
+                prev_lines="$LINES"
+                prev_lang="$cur_lang"
             fi
 
-            if read_hotkey 2; then
+            tick=$(( (tick + 1) % 15 ))
+            if read_hotkey 0.2; then
                 handle_global_hotkey "$REPLY_KEY" || true
+                tick=0
             fi
         done
         ;;
@@ -655,56 +694,80 @@ case "$CLI_MODE" in
     --pane-agents)
         CURRENT_PANE_NUM="2"
         printf '\033[?7l\033[?25l'
+        tick=0
+        prev_active=""
+        prev_cols=0
+        prev_lines=0
+        AGENT_LINES=()
+        ACTIVE_CNT=0
+        DISCONN_CNT=0
+        TOTAL_CNT=0
+
         while true; do
-            load_i18n
+            cur_active=$(get_pane_active)
             COLS=$(tput cols 2>/dev/null || echo 40)
             LINES=$(tput lines 2>/dev/null || echo 12)
-            ACTIVE_CNT=$("$BIN_AGENT" -lc 2>/dev/null | grep -c "ID:" || true)
-            DISCONN_CNT=$("$BIN_AGENT" -ln 2>/dev/null | grep -c "ID:" || true)
-            TOTAL_CNT=$(( ACTIVE_CNT + DISCONN_CNT ))
 
-            AG_BAR=$(make_braille_bar "$ACTIVE_CNT" "$TOTAL_CNT" 6 "$GREEN")
-            BADGE="${AG_BAR} Act:${GREEN}${ACTIVE_CNT}${NC} Dis:${RED}${DISCONN_CNT}${NC}"
+            if [ "$tick" -eq 0 ] || [ "$COLS" -ne "$prev_cols" ] || [ "$LINES" -ne "$prev_lines" ]; then
+                load_i18n
+                ACTIVE_CNT=$("$BIN_AGENT" -lc 2>/dev/null | grep -c "ID:" || true)
+                DISCONN_CNT=$("$BIN_AGENT" -ln 2>/dev/null | grep -c "ID:" || true)
+                TOTAL_CNT=$(( ACTIVE_CNT + DISCONN_CNT ))
 
-            draw_btop_frame "$COLS" "$LINES" "²" "agents" "$BADGE"
-            BOT_COUNT="${BOX_CLR}─┐${WHITE}${ACTIVE_CNT}/${TOTAL_CNT}${BOX_CLR}┌─╯${NC}"
-            c_pos=$(( COLS - ${#ACTIVE_CNT} - ${#TOTAL_CNT} - 6 ))
-            [ "$c_pos" -gt 4 ] && printf '\033[%d;%dH%s' "$LINES" "$c_pos" "$BOT_COUNT"
+                NAME_W=$(( COLS - 25 ))
+                [ "$NAME_W" -lt 8 ] && NAME_W=8
+                MAX_AGENTS=$(( LINES - 3 ))
+                [ "$MAX_AGENTS" -lt 1 ] && MAX_AGENTS=1
 
-            NAME_W=$(( COLS - 25 ))
-            [ "$NAME_W" -lt 8 ] && NAME_W=8
-            MAX_AGENTS=$(( LINES - 3 ))
-            [ "$MAX_AGENTS" -lt 1 ] && MAX_AGENTS=1
+                mapfile -t AGENT_LINES < <(
+                    "$BIN_AGENT" -l 2>/dev/null | grep "ID:" | head -n "$MAX_AGENTS" | \
+                    awk -F',' -v nw="$NAME_W" -v G="$GREEN" -v R="$RED" -v Y="$YELLOW" -v C="$CYAN" -v N="$NC" '{
+                        id=$1; sub(/.*ID: */, "", id)
+                        name=$2; sub(/.*Name: */, "", name)
+                        ip=$3; sub(/.*IP: */, "", ip)
+                        st=$4; sub(/^ */, "", st)
 
-            HDR=$(printf "%s%-3s %-*s %-10s %s%s" "$DIM" "ID" "$NAME_W" "NAME" "IP" "STAT" "$NC")
-            put_row 2 "$COLS" "$HDR"
+                        if (length(name) > nw) name = substr(name, 1, nw - 1) "+"
+                        if (length(ip) > 10)   ip   = substr(ip, 1, 9) "+"
 
-            mapfile -t AGENT_LINES < <(
-                "$BIN_AGENT" -l 2>/dev/null | grep "ID:" | head -n "$MAX_AGENTS" | \
-                awk -F',' -v nw="$NAME_W" -v G="$GREEN" -v R="$RED" -v Y="$YELLOW" -v C="$CYAN" -v N="$NC" '{
-                    id=$1; sub(/.*ID: */, "", id)
-                    name=$2; sub(/.*Name: */, "", name)
-                    ip=$3; sub(/.*IP: */, "", ip)
-                    st=$4; sub(/^ */, "", st)
+                        if (st ~ /Active/)            st_str = G "⣿ ACTV" N
+                        else if (st ~ /Disconnected/) st_str = R "⣀ DISC" N
+                        else                          st_str = Y "⡀ NEVR" N
 
-                    if (length(name) > nw) name = substr(name, 1, nw - 1) "+"
-                    if (length(ip) > 10)   ip   = substr(ip, 1, 9) "+"
+                        printf "%s%-3s%s %-*s %-10s %s\n", C, id, N, nw, name, ip, st_str
+                    }'
+                )
+            fi
 
-                    if (st ~ /Active/)            st_str = G "⣿ ACTV" N
-                    else if (st ~ /Disconnected/) st_str = R "⣀ DISC" N
-                    else                          st_str = Y "⡀ NEVR" N
+            if [ "$tick" -eq 0 ] || [ "$cur_active" != "$prev_active" ] || [ "$COLS" -ne "$prev_cols" ] || [ "$LINES" -ne "$prev_lines" ]; then
+                AG_BAR=$(make_braille_bar "$ACTIVE_CNT" "$TOTAL_CNT" 6 "$GREEN")
+                BADGE="${AG_BAR} Act:${GREEN}${ACTIVE_CNT}${NC} Dis:${RED}${DISCONN_CNT}${NC}"
 
-                    printf "%s%-3s%s %-*s %-10s %s\n", C, id, N, nw, name, ip, st_str
-                }'
-            )
-            cur_row=3
-            for aline in "${AGENT_LINES[@]}"; do
-                [ "$cur_row" -lt "$LINES" ] && put_row "$cur_row" "$COLS" "$aline"
-                cur_row=$(( cur_row + 1 ))
-            done
+                draw_btop_frame "$COLS" "$LINES" "²" "agents" "$BADGE"
+                BOT_COUNT="${BOX_CLR}─┐${WHITE}${ACTIVE_CNT}/${TOTAL_CNT}${BOX_CLR}┌─╯${NC}"
+                c_pos=$(( COLS - ${#ACTIVE_CNT} - ${#TOTAL_CNT} - 6 ))
+                [ "$c_pos" -gt 4 ] && printf '\033[%d;%dH%s' "$LINES" "$c_pos" "$BOT_COUNT"
 
-            if read_hotkey 2; then
+                NAME_W=$(( COLS - 25 ))
+                [ "$NAME_W" -lt 8 ] && NAME_W=8
+                HDR=$(printf "%s%-3s %-*s %-10s %s%s" "$DIM" "ID" "$NAME_W" "NAME" "IP" "STAT" "$NC")
+                put_row 2 "$COLS" "$HDR"
+
+                cur_row=3
+                for aline in "${AGENT_LINES[@]}"; do
+                    [ "$cur_row" -lt "$LINES" ] && put_row "$cur_row" "$COLS" "$aline"
+                    cur_row=$(( cur_row + 1 ))
+                done
+
+                prev_active="$cur_active"
+                prev_cols="$COLS"
+                prev_lines="$LINES"
+            fi
+
+            tick=$(( (tick + 1) % 15 ))
+            if read_hotkey 0.2; then
                 handle_global_hotkey "$REPLY_KEY" || true
+                tick=0
             fi
         done
         ;;
@@ -712,53 +775,73 @@ case "$CLI_MODE" in
     --pane-alerts)
         CURRENT_PANE_NUM="3"
         printf '\033[?7l\033[?25l'
+        tick=0
+        prev_active=""
+        prev_cols=0
+        prev_lines=0
+        prev_lvl=""
+        ALERT_LINES=()
+
         while true; do
-            load_i18n
+            cur_active=$(get_pane_active)
             COLS=$(tput cols 2>/dev/null || echo 40)
             LINES=$(tput lines 2>/dev/null || echo 12)
             MIN_LVL=$(cat "$STATE_LEVEL" 2>/dev/null || echo 5)
             MAX_ROWS=$(( LINES - 2 ))
             [ "$MAX_ROWS" -lt 1 ] && MAX_ROWS=1
 
-            LVL_BAR=$(make_braille_bar "$MIN_LVL" 15 5 "$YELLOW")
-            BADGE="${LVL_BAR} ${YELLOW}Lv>=${MIN_LVL}${NC}"
-            draw_btop_frame "$COLS" "$LINES" "³" "alerts" "$BADGE"
+            if [ "$tick" -eq 0 ] || [ "$MIN_LVL" != "$prev_lvl" ] || [ "$COLS" -ne "$prev_cols" ] || [ "$LINES" -ne "$prev_lines" ]; then
+                load_i18n
+                if [ -f "$LOG_ALERTS" ]; then
+                    mapfile -t ALERT_LINES < <(
+                        tail -n 300 "$LOG_ALERTS" 2>/dev/null | \
+                        jq --argjson lvl "$MIN_LVL" -r '
+                            select(.rule.level >= $lvl) |
+                            "\(.timestamp[11:19])|\(.rule.level)|\(.agent.name // "Mgr")|\(.rule.id)|\(.rule.description)\(if .data.srcip then " [" + .data.srcip + "]" else "" end)"
+                        ' 2>/dev/null | tail -n "$MAX_ROWS" | \
+                        awk -F'|' -v cols="$COLS" -v R="$RED" -v Y="$YELLOW" -v G="$GREEN" -v N="$NC" '{
+                            tm=$1; lv=$2; ag=$3; rl=$4; ds=$5
+                            if (length(ag) > 9) ag = substr(ag, 1, 8) "+"
+                            prefix = sprintf("%s L%-2d %-9s R%-4s ", tm, lv, ag, rl)
+                            rem = cols - length(prefix) - 4
+                            if (rem < 5) rem = 5
+                            if (length(ds) > rem) ds = substr(ds, 1, rem - 1) "+"
 
-            VER_TAG="wtop ${WTOP_VERSION}"
-            v_pos=$(( COLS - ${#VER_TAG} - 5 ))
-            [ "$v_pos" -gt 4 ] && printf '\033[%d;%dH%s─┐%s%s%s┌─╯%s' "$LINES" "$v_pos" "$BOX_CLR" "$CYAN" "$VER_TAG" "$BOX_CLR" "$NC"
+                            if (lv >= 10)     c = R
+                            else if (lv >= 7) c = Y
+                            else              c = G
 
-            if [ -f "$LOG_ALERTS" ]; then
-                mapfile -t ALERT_LINES < <(
-                    tail -n 300 "$LOG_ALERTS" 2>/dev/null | \
-                    jq --argjson lvl "$MIN_LVL" -r '
-                        select(.rule.level >= $lvl) |
-                        "\(.timestamp[11:19])|\(.rule.level)|\(.agent.name // "Mgr")|\(.rule.id)|\(.rule.description)\(if .data.srcip then " [" + .data.srcip + "]" else "" end)"
-                    ' 2>/dev/null | tail -n "$MAX_ROWS" | \
-                    awk -F'|' -v cols="$COLS" -v R="$RED" -v Y="$YELLOW" -v G="$GREEN" -v N="$NC" '{
-                        tm=$1; lv=$2; ag=$3; rl=$4; ds=$5
-                        if (length(ag) > 9) ag = substr(ag, 1, 8) "+"
-                        prefix = sprintf("%s L%-2d %-9s R%-4s ", tm, lv, ag, rl)
-                        rem = cols - length(prefix) - 4
-                        if (rem < 5) rem = 5
-                        if (length(ds) > rem) ds = substr(ds, 1, rem - 1) "+"
+                            printf "%s%s%s%s\n", c, prefix, ds, N
+                        }'
+                    )
+                fi
+            fi
 
-                        if (lv >= 10)     c = R
-                        else if (lv >= 7) c = Y
-                        else              c = G
+            if [ "$tick" -eq 0 ] || [ "$cur_active" != "$prev_active" ] || [ "$MIN_LVL" != "$prev_lvl" ] || [ "$COLS" -ne "$prev_cols" ] || [ "$LINES" -ne "$prev_lines" ]; then
+                LVL_BAR=$(make_braille_bar "$MIN_LVL" 15 5 "$YELLOW")
+                BADGE="${LVL_BAR} ${YELLOW}Lv>=${MIN_LVL}${NC}"
+                draw_btop_frame "$COLS" "$LINES" "³" "alerts" "$BADGE"
 
-                        printf "%s%s%s%s\n", c, prefix, ds, N
-                    }'
-                )
+                VER_TAG="wtop ${WTOP_VERSION}"
+                v_pos=$(( COLS - ${#VER_TAG} - 5 ))
+                [ "$v_pos" -gt 4 ] && printf '\033[%d;%dH%s─┐%s%s%s┌─╯%s' "$LINES" "$v_pos" "$BOX_CLR" "$CYAN" "$VER_TAG" "$BOX_CLR" "$NC"
+
                 cur_row=2
                 for al in "${ALERT_LINES[@]}"; do
                     [ "$cur_row" -lt "$LINES" ] && put_row "$cur_row" "$COLS" "$al"
                     cur_row=$(( cur_row + 1 ))
                 done
+
+                prev_active="$cur_active"
+                prev_lvl="$MIN_LVL"
+                prev_cols="$COLS"
+                prev_lines="$LINES"
             fi
 
-            if read_hotkey 2; then
+            tick=$(( (tick + 1) % 10 ))
+            if read_hotkey 0.2; then
                 handle_global_hotkey "$REPLY_KEY" || true
+                tick=0
             fi
         done
         ;;
@@ -766,61 +849,84 @@ case "$CLI_MODE" in
     --pane-console)
         CURRENT_PANE_NUM="4"
         printf '\033[?7l'
+        tick=0
+        prev_active=""
+        prev_cols=0
+        prev_lines=0
+        prev_lvl=""
+        prev_lang=""
+        OSLINES=()
+
         while true; do
             if ! check_term_size_guard; then
-                sleep 1
+                sleep 0.5
+                prev_cols=0
                 continue
             fi
 
-            load_i18n
+            cur_active=$(get_pane_active)
             COLS=$(tput cols 2>/dev/null || echo 40)
             LINES=$(tput lines 2>/dev/null || echo 12)
             CUR_LVL=$(cat "$STATE_LEVEL" 2>/dev/null || echo 5)
             CUR_LANG=$(cat "$STATE_LANG" 2>/dev/null || echo "zh")
 
-            update_active_box_color
+            if [ "$tick" -eq 0 ] || [ "$COLS" -ne "$prev_cols" ] || [ "$LINES" -ne "$prev_lines" ] || [ "$CUR_LANG" != "$prev_lang" ]; then
+                load_i18n "$CUR_LANG"
+                LOG_ROWS=$(( LINES - 3 ))
+                [ "$LOG_ROWS" -lt 1 ] && LOG_ROWS=1
 
-            TOP_BADGE="${RED}f${WHITE}:Lv>=${CUR_LVL} ${RED}l${WHITE}:${CUR_LANG} ${RED}z${WHITE}:Zoom${NC}"
-            if [ "$CUR_LANG" = "zh" ]; then
-                BOT_KEYS="${BOX_CLR}─┐${RED}b${WHITE}封鎖${BOX_CLR}┌┐${RED}p${WHITE}清理${BOX_CLR}┌┐${RED}i${WHITE}詳情${BOX_CLR}┌┐${RED}r${WHITE}重啟${BOX_CLR}┌┐${RED}d${WHITE}刪除${BOX_CLR}┌┐${RED}s${WHITE}FIM${BOX_CLR}┌┐${RED}q${WHITE}離開${BOX_CLR}┌${NC}"
-            else
-                BOT_KEYS="${BOX_CLR}─┐${RED}b${WHITE}Blk${BOX_CLR}┌┐${RED}p${WHITE}Prg${BOX_CLR}┌┐${RED}i${WHITE}Info${BOX_CLR}┌┐${RED}r${WHITE}Rst${BOX_CLR}┌┐${RED}d${WHITE}Del${BOX_CLR}┌┐${RED}s${WHITE}FIM${BOX_CLR}┌┐${RED}q${WHITE}Quit${BOX_CLR}┌${NC}"
+                if [ -f "$LOG_OSSEC" ]; then
+                    mapfile -t OSLINES < <(
+                        grep -E "wazuh-authd|ERROR|WARNING" "$LOG_OSSEC" 2>/dev/null | tail -n "$LOG_ROWS" | \
+                        awk -v cols="$COLS" -v R="$RED" -v Y="$YELLOW" -v C="$CYAN" -v N="$NC" '{
+                            line = $0
+                            sub(/^[0-9\/]+ /, "", line)
+                            sub(/wazuh-/, "", line)
+                            maxw = cols - 4
+                            if (length(line) > maxw) line = substr(line, 1, maxw - 1) "+"
+                            if (line ~ /ERROR/)        printf "%s%s%s\n", R, line, N
+                            else if (line ~ /WARNING/) printf "%s%s%s\n", Y, line, N
+                            else                       printf "%s%s%s\n", C, line, N
+                        }'
+                    )
+                fi
             fi
 
-            draw_btop_frame "$COLS" "$LINES" "⁴" "logs & control" "$TOP_BADGE" "$BOT_KEYS"
+            if [ "$tick" -eq 0 ] || [ "$cur_active" != "$prev_active" ] || [ "$CUR_LVL" != "$prev_lvl" ] || [ "$CUR_LANG" != "$prev_lang" ] || [ "$COLS" -ne "$prev_cols" ] || [ "$LINES" -ne "$prev_lines" ]; then
+                update_active_box_color
 
-            LOG_ROWS=$(( LINES - 3 ))
-            [ "$LOG_ROWS" -lt 1 ] && LOG_ROWS=1
+                TOP_BADGE="${RED}f${WHITE}:Lv>=${CUR_LVL} ${RED}l${WHITE}:${CUR_LANG} ${RED}z${WHITE}:Zoom${NC}"
+                if [ "$CUR_LANG" = "zh" ]; then
+                    BOT_KEYS="${BOX_CLR}─┐${RED}b${WHITE}封鎖${BOX_CLR}┌┐${RED}p${WHITE}清理${BOX_CLR}┌┐${RED}i${WHITE}詳情${BOX_CLR}┌┐${RED}r${WHITE}重啟${BOX_CLR}┌┐${RED}d${WHITE}刪除${BOX_CLR}┌┐${RED}s${WHITE}FIM${BOX_CLR}┌┐${RED}q${WHITE}離開${BOX_CLR}┌${NC}"
+                else
+                    BOT_KEYS="${BOX_CLR}─┐${RED}b${WHITE}Blk${BOX_CLR}┌┐${RED}p${WHITE}Prg${BOX_CLR}┌┐${RED}i${WHITE}Info${BOX_CLR}┌┐${RED}r${WHITE}Rst${BOX_CLR}┌┐${RED}d${WHITE}Del${BOX_CLR}┌┐${RED}s${WHITE}FIM${BOX_CLR}┌┐${RED}q${WHITE}Quit${BOX_CLR}┌${NC}"
+                fi
 
-            if [ -f "$LOG_OSSEC" ]; then
-                mapfile -t OSLINES < <(
-                    grep -E "wazuh-authd|ERROR|WARNING" "$LOG_OSSEC" 2>/dev/null | tail -n "$LOG_ROWS" | \
-                    awk -v cols="$COLS" -v R="$RED" -v Y="$YELLOW" -v C="$CYAN" -v N="$NC" '{
-                        line = $0
-                        sub(/^[0-9\/]+ /, "", line)
-                        sub(/wazuh-/, "", line)
-                        maxw = cols - 4
-                        if (length(line) > maxw) line = substr(line, 1, maxw - 1) "+"
-                        if (line ~ /ERROR/)        printf "%s%s%s\n", R, line, N
-                        else if (line ~ /WARNING/) printf "%s%s%s\n", Y, line, N
-                        else                       printf "%s%s%s\n", C, line, N
-                    }'
-                )
+                draw_btop_frame "$COLS" "$LINES" "⁴" "logs & control" "$TOP_BADGE" "$BOT_KEYS"
+
                 cur_row=2
                 for oline in "${OSLINES[@]}"; do
                     [ "$cur_row" -lt $(( LINES - 1 )) ] && put_row "$cur_row" "$COLS" "$oline"
                     cur_row=$(( cur_row + 1 ))
                 done
+
+                put_row $(( LINES - 1 )) "$COLS" "${DIM}${MSG_NAV_HINT}${NC}"
+
+                prev_active="$cur_active"
+                prev_lvl="$CUR_LVL"
+                prev_lang="$CUR_LANG"
+                prev_cols="$COLS"
+                prev_lines="$LINES"
             fi
 
-            put_row $(( LINES - 1 )) "$COLS" "${DIM}${MSG_NAV_HINT}${NC}"
-
+            tick=$(( (tick + 1) % 12 ))
             printf '\033[?25l\033[%d;%dH' "$LINES" "$COLS"
-            if ! read_hotkey 2; then
+            if ! read_hotkey 0.2; then
                 continue
             fi
 
             if handle_global_hotkey "$REPLY_KEY"; then
+                tick=0
                 continue
             fi
 
@@ -868,6 +974,8 @@ case "$CLI_MODE" in
                         echo ""
                         read -r -p "$MSG_PROMPT_ENTER" _
                     fi
+                    tick=0
+                    prev_cols=0
                     ;;
                 p|P)
                     printf '\033[?25h\033[2J\033[H'
@@ -895,6 +1003,8 @@ case "$CLI_MODE" in
                             read -r -p "$MSG_PROMPT_ENTER" _
                         fi
                     fi
+                    tick=0
+                    prev_cols=0
                     ;;
                 i|I)
                     printf '\033[?25h\033[%d;3H\033[K' $(( LINES - 1 ))
@@ -915,6 +1025,8 @@ case "$CLI_MODE" in
                             read -r -p "$MSG_PROMPT_ENTER" _
                         fi
                     fi
+                    tick=0
+                    prev_cols=0
                     ;;
                 r|R)
                     printf '\033[?25h\033[%d;3H\033[K' $(( LINES - 1 ))
@@ -937,6 +1049,8 @@ case "$CLI_MODE" in
                             sleep 1.2
                         fi
                     fi
+                    tick=0
+                    prev_cols=0
                     ;;
                 d|D)
                     printf '\033[?25h\033[%d;3H\033[K' $(( LINES - 1 ))
@@ -962,11 +1076,15 @@ case "$CLI_MODE" in
                             [[ "$rst" =~ ^[Yy]$ ]] && safe_restart_manager
                         fi
                     fi
+                    tick=0
+                    prev_cols=0
                     ;;
                 s|S)
                     "$BIN_AGENT" -r -a >/dev/null 2>&1
                     put_row $(( LINES - 1 )) "$COLS" "${GREEN}${MSG_FIM_OK}${NC}"
                     sleep 1
+                    tick=0
+                    prev_cols=0
                     ;;
             esac
         done
@@ -976,7 +1094,11 @@ case "$CLI_MODE" in
         preflight_check "${ORIG_ARGS[@]}"
         load_i18n
 
+        # 清除任何舊版殘留的 tmux 全域/Session Hook，防止觸發 run-shell 報錯
+        tmux set-hook -gu after-select-pane 2>/dev/null || true
+
         if tmux has-session -t "$SESSION" 2>/dev/null; then
+            tmux set-hook -u -t "$SESSION" after-select-pane 2>/dev/null || true
             exec tmux -2 attach-session -t "$SESSION"
         fi
 
@@ -988,12 +1110,12 @@ case "$CLI_MODE" in
         tmux set-option -t "$SESSION" pane-active-border-style fg=brightcyan,bold
         tmux set-option -t "$SESSION" pane-border-lines heavy 2>/dev/null || true
 
+        # 防止滑鼠點擊時微幅滑動誤觸 tmux 內建的 [0/0] 複製模式
+        tmux unbind-key -n MouseDrag1Pane 2>/dev/null || true
+
         tmux split-window -h -t "${SESSION}:0.0" "$0 --pane-agents"
         tmux split-window -v -t "${SESSION}:0.0" "$0 --pane-alerts"
         tmux split-window -v -t "${SESSION}:0.2" "$0 --pane-console"
-
-        tmux set-hook -t "$SESSION" after-select-pane \
-            "run-shell 'pkill -USR1 -f \"wtop --pane-\" 2>/dev/null || true'" 2>/dev/null || true
 
         tmux select-pane -t "${SESSION}:0.3"
         exec tmux -2 attach-session -t "$SESSION"
